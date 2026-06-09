@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# maximum shadow-map resolution used for rendering
+# 8192 is hald the default and noticeably faster,
+# while looking almost identical when downscaled
+MAX_RENDER_SHADOWSIZE = 8192
+
 
 class BaseMujocoEnv(ABC):
     object_managers: list["ObjectManager"]
@@ -204,6 +209,8 @@ class CPUMujocoEnv(BaseMujocoEnv):
         else:
             width, height = (640, 480)  # Default resolution
         device_id = getattr(self.config.task_sampler_config, "render_device", 0)
+        if self.mj_model.vis.quality.shadowsize > MAX_RENDER_SHADOWSIZE:
+            self.mj_model.vis.quality.shadowsize = MAX_RENDER_SHADOWSIZE
         self._renderer = MjOpenGLRenderer(model=self.mj_model, width=width, height=height, device_id=device_id)
         if self._parallelize and self._n_batch > 1:
             self._executor = ThreadPoolExecutor(max_workers=self._n_batch)
