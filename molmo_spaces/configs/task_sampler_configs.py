@@ -27,6 +27,12 @@ class BaseMujocoTaskSamplerConfig(Config):
     randomize_robot_textures: bool = False  # Whether to randomize the textures of the robot
     randomize_dynamics: bool = False  # Whether to randomize the dynamics of the scene
 
+    randomize_init_object_positions: bool = False  # Perturb object XY around spec poses
+    init_object_position_noise_xy: float = 0.01  # Half-width of uniform XY noise, meters
+    randomize_init_qpos: bool = False  # Perturb robot init_qpos around spec values
+    init_qpos_noise: float = 0.01  # Half-width of uniform per-joint noise, radians
+    init_position_randomization_max_attempts: int = 20  # Rejection-sampling tries per object/group
+
     # Failure recovery parameters (used by ParallelRolloutRunner)
     max_allowed_sequential_task_sampler_failures: int = 10
     max_allowed_sequential_rollout_failures: int = 10

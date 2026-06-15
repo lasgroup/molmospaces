@@ -57,6 +57,7 @@ from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.tasks.task_sampler import BaseMujocoTaskSampler
 from molmo_spaces.utils.constants.simulation_constants import OBJAVERSE_FREE_JOINT_DEFAULT_DAMPING
 from molmo_spaces.utils.lazy_loading_utils import install_uid
+from molmo_spaces.utils.mujoco_scene_utils import get_supporting_geom
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat
 
 log = logging.getLogger(__name__)
@@ -571,12 +572,106 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         mujoco.mj_forward(model, data)
         self.set_joint_values(env)
 
-        # Set robot joint positions from episode spec
+        # Optionally perturb object XY positions around the spec poses.
+        tsc = self.config.task_sampler_config
+        if getattr(tsc, "randomize_init_object_positions", False) and object_poses:
+            self._randomize_object_positions(env, object_poses)
+
+        # Set robot joint positions from episode spec (optionally perturbed).
         for group_name, qpos in self.episode_spec.robot.init_qpos.items():
-            robot_view.get_move_group(group_name).joint_pos = np.array(qpos)
+            qpos = np.array(qpos)
+            if getattr(tsc, "randomize_init_qpos", False):
+                qpos = self._randomize_qpos(env, robot_view, group_name, qpos)
+            robot_view.get_move_group(group_name).joint_pos = qpos
 
         mujoco.mj_forward(model, data)
         log.info("Scene setup from episode spec completed.")
+
+    def _randomize_object_positions(self, env: CPUMujocoEnv, object_poses: dict) -> None:
+        """Add small XY noise to each object's spec pose, rejecting poses that
+        collide with non-supporting bodies or fall off the support surface.
+
+        Objects are perturbed sequentially; each candidate is checked against the
+        scene as already perturbed, so objects do not overlap each other.
+        """
+        tsc = self.config.task_sampler_config
+        noise_xy = tsc.init_object_position_noise_xy
+        max_attempts = tsc.init_position_randomization_max_attempts
+        model = env.current_model
+        data = env.current_data
+
+        for body_name, pose in object_poses.items():
+            body = create_mlspaces_body(data, body_name)
+            root_id = int(model.body_rootid[body.body_id])
+            orig_pos = np.array(pose[0:3])
+
+            # Identify the surface the object rests on so we can allow contact
+            # with it while rejecting contact with anything else.
+            body.position = orig_pos
+            mujoco.mj_fwdPosition(model, data)
+            support_geom = get_supporting_geom(data, root_id)
+            support_root = (
+                int(model.body_rootid[model.geom_bodyid[support_geom]])
+                if support_geom is not None
+                else None
+            )
+
+            placed = False
+            for _ in range(max_attempts):
+                new_pos = orig_pos.copy()
+                new_pos[:2] += np.random.uniform(-noise_xy, noise_xy, size=2)
+                body.position = new_pos
+                mujoco.mj_fwdPosition(model, data)
+
+                in_collision = False
+                for c in data.contact:
+                    rb1 = model.body_rootid[model.geom_bodyid[c.geom1]]
+                    rb2 = model.body_rootid[model.geom_bodyid[c.geom2]]
+                    if (rb1 == root_id) ^ (rb2 == root_id):
+                        other = rb1 if rb1 != root_id else rb2
+                        if other != support_root:
+                            in_collision = True
+                            break
+                if in_collision:
+                    continue
+                # Reject if the object is no longer resting on a surface.
+                if support_root is not None and get_supporting_geom(data, root_id) is None:
+                    continue
+                placed = True
+                break
+
+            if not placed:
+                body.position = orig_pos
+                mujoco.mj_fwdPosition(model, data)
+                log.info(f"Could not perturb {body_name}; kept spec position.")
+
+    def _randomize_qpos(
+        self, env: CPUMujocoEnv, robot_view, group_name: str, qpos: np.ndarray
+    ) -> np.ndarray:
+        """Add small per-joint noise to a move group's spec qpos, rejecting
+        configurations that put the robot in collision. Falls back to the spec
+        qpos if no valid perturbation is found."""
+        tsc = self.config.task_sampler_config
+        noise = tsc.init_qpos_noise
+        max_attempts = tsc.init_position_randomization_max_attempts
+        model = env.current_model
+        data = env.current_data
+
+        mg = robot_view.get_move_group(group_name)
+        limits = mg.joint_pos_limits
+        lower, upper = limits[:, 0], limits[:, 1]
+
+        for _ in range(max_attempts):
+            cand = np.clip(qpos + np.random.uniform(-noise, noise, size=qpos.shape), lower, upper)
+            mg.joint_pos = cand
+            mujoco.mj_forward(model, data)
+            if not env.check_robot_collision_in_current_pose():
+                return cand
+
+        mg.joint_pos = qpos
+        mujoco.mj_forward(model, data)
+        log.info(f"Could not perturb qpos for group {group_name}; kept spec values.")
+        return qpos
 
     def setup_cameras(self, env: CPUMujocoEnv, deterministic_only: bool = False) -> None:
         """
